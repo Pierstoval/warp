@@ -50,6 +50,7 @@ impl std::error::Error for TlsConfigError {}
 pub(crate) struct TlsConfigBuilder {
     cert: Box<dyn Read + Send + Sync>,
     key: Box<dyn Read + Send + Sync>,
+    upgrade: bool,
 }
 
 impl std::fmt::Debug for TlsConfigBuilder {
@@ -64,6 +65,7 @@ impl TlsConfigBuilder {
         TlsConfigBuilder {
             key: Box::new(io::empty()),
             cert: Box::new(io::empty()),
+            upgrade: false,
         }
     }
 
@@ -97,7 +99,13 @@ impl TlsConfigBuilder {
         self
     }
 
-    pub(crate) fn build(mut self) -> Result<ServerConfig, TlsConfigError> {
+    /// sets if http should be upgraded to https
+    pub(crate) fn upgrade(mut self, upgrade: bool) -> Self {
+        self.upgrade = upgrade;
+        self
+    }
+
+    pub(crate) fn build(mut self) -> Result<(ServerConfig, bool), TlsConfigError> {
         let mut cert_rdr = BufReader::new(self.cert);
         let cert = tokio_rustls::rustls::internal::pemfile::certs(&mut cert_rdr)
             .map_err(|()| TlsConfigError::CertParseError)?;
@@ -139,7 +147,7 @@ impl TlsConfigBuilder {
             .set_single_cert(cert, key)
             .map_err(|err| TlsConfigError::InvalidKey(err))?;
         config.set_protocols(&["h2".into(), "http/1.1".into()]);
-        Ok(config)
+        Ok((config, self.upgrade))
     }
 }
 
@@ -174,11 +182,20 @@ impl Transport for TlsStream {
     fn remote_addr(&self) -> Option<SocketAddr> {
         Some(self.remote_addr)
     }
+
+    fn upgrade_to_https(&self) -> bool {
+        if let State::Upgrading(..) = self.state {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 enum State {
     Handshaking(tokio_rustls::Accept<AddrStream>),
     Streaming(tokio_rustls::server::TlsStream<AddrStream>),
+    Upgrading(AddrStream),
 }
 
 // tokio_rustls::server::TlsStream doesn't expose constructor methods,
@@ -190,13 +207,14 @@ pub(crate) struct TlsStream {
 }
 
 impl TlsStream {
-    fn new(stream: AddrStream, config: Arc<ServerConfig>) -> TlsStream {
+    fn new(stream: AddrStream, config: Arc<ServerConfig>, is_tls: bool) -> TlsStream {
         let remote_addr = stream.remote_addr();
-        let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
-        TlsStream {
-            state: State::Handshaking(accept),
-            remote_addr,
-        }
+        let state = if is_tls {
+            State::Handshaking(tokio_rustls::TlsAcceptor::from(config).accept(stream))
+        } else {
+            State::Upgrading(stream)
+        };
+        TlsStream { state, remote_addr }
     }
 }
 
@@ -217,6 +235,7 @@ impl AsyncRead for TlsStream {
                 Err(err) => Poll::Ready(Err(err)),
             },
             State::Streaming(ref mut stream) => Pin::new(stream).poll_read(cx, buf),
+            State::Upgrading(ref mut stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -238,6 +257,7 @@ impl AsyncWrite for TlsStream {
                 Err(err) => Poll::Ready(Err(err)),
             },
             State::Streaming(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
+            State::Upgrading(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -245,6 +265,7 @@ impl AsyncWrite for TlsStream {
         match self.state {
             State::Handshaking(_) => Poll::Ready(Ok(())),
             State::Streaming(ref mut stream) => Pin::new(stream).poll_flush(cx),
+            State::Upgrading(ref mut stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -252,6 +273,7 @@ impl AsyncWrite for TlsStream {
         match self.state {
             State::Handshaking(_) => Poll::Ready(Ok(())),
             State::Streaming(ref mut stream) => Pin::new(stream).poll_shutdown(cx),
+            State::Upgrading(ref mut stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -259,13 +281,17 @@ impl AsyncWrite for TlsStream {
 pub(crate) struct TlsAcceptor {
     config: Arc<ServerConfig>,
     incoming: AddrIncoming,
+    upgrade: bool,
+    sock: Option<AddrStream>,
 }
 
 impl TlsAcceptor {
-    pub(crate) fn new(config: ServerConfig, incoming: AddrIncoming) -> TlsAcceptor {
+    pub(crate) fn new(config: ServerConfig, incoming: AddrIncoming, upgrade: bool) -> TlsAcceptor {
         TlsAcceptor {
             config: Arc::new(config),
             incoming,
+            upgrade,
+            sock: None,
         }
     }
 }
@@ -279,10 +305,46 @@ impl Accept for TlsAcceptor {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
         let pin = self.get_mut();
-        match ready!(Pin::new(&mut pin.incoming).poll_accept(cx)) {
-            Some(Ok(sock)) => Poll::Ready(Some(Ok(TlsStream::new(sock, pin.config.clone())))),
-            Some(Err(e)) => Poll::Ready(Some(Err(e))),
-            None => Poll::Ready(None),
+        if let Some(ref mut sock) = pin.sock {
+            let mut byte = [0];
+            match ready!(sock.poll_peek(cx, &mut byte)) {
+                Ok(_) => Poll::Ready(Some(Ok(TlsStream::new(
+                    pin.sock.take().unwrap(),
+                    pin.config.clone(),
+                    byte == [0x16],
+                )))),
+                Err(e) => Poll::Ready(Some(Err(e))),
+            }
+        } else {
+            match ready!(Pin::new(&mut pin.incoming).poll_accept(cx)) {
+                Some(Ok(mut sock)) => {
+                    if pin.upgrade {
+                        let mut byte = [0];
+                        match sock.poll_peek(cx, &mut byte) {
+                            Poll::Pending => {
+                                pin.sock = Some(sock);
+                                Poll::Pending
+                            }
+                            Poll::Ready(peek) => match peek {
+                                Ok(_) => Poll::Ready(Some(Ok(TlsStream::new(
+                                    sock,
+                                    pin.config.clone(),
+                                    byte == [0x16],
+                                )))),
+                                Err(e) => Poll::Ready(Some(Err(e))),
+                            },
+                        }
+                    } else {
+                        Poll::Ready(Some(Ok(TlsStream::new(
+                            sock,
+                            pin.config.clone(),
+                            pin.upgrade,
+                        ))))
+                    }
+                }
+                Some(Err(e)) => Poll::Ready(Some(Err(e))),
+                None => Poll::Ready(None),
+            }
         }
     }
 }
